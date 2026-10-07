@@ -43,7 +43,7 @@ STORE_PATH = os.path.join(STORE_DIR, "fulltext.jsonl")
 USER_AGENT = "moengage-docs-mcp/1.0"
 WORKERS = 4          # gentle: docs hosts rate-limit heavy concurrency (HTTP 429)
 MAX_RETRIES = 5      # retry 429/5xx with exponential backoff
-MAX_INDEX_DEPTH = 3  # how deep nested llms index files are followed
+MAX_INDEX_DEPTH = 10  # how deep nested llms index files are followed
 
 # Language prefixes the docs platform uses for translated pages.
 LOCALES = {
@@ -51,7 +51,7 @@ LOCALES = {
     "zh-hant", "id", "vi", "th", "ar", "tr", "ru", "nl", "pl", "sv", "hi", "ms",
 }
 
-LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)(?:\s*:\s*(.*))?")
+LINK_RE = re.compile(r"\[([^\]]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)(?:\s*:\s*(.*))?")
 HEADING_RE = re.compile(r"^#{1,6}\s+(.*)$")
 FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 TAGS_RE = re.compile(r"^(?:tags|keywords):\s*\[(.*?)\]", re.MULTILINE)
@@ -65,9 +65,16 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+def quote_url(url):
+    """Percent-encode the path (some slugs contain em-dashes, "%" or "?")."""
+    p = urllib.parse.urlsplit(url)
+    path = urllib.parse.quote(urllib.parse.unquote(p.path), safe="/:@!$&'()*+,;=-._~")
+    return urllib.parse.urlunsplit((p.scheme, p.netloc, path, p.query, ""))
+
+
 def http_get(url, timeout=30, retries=MAX_RETRIES):
     req = urllib.request.Request(
-        url, headers={"User-Agent": USER_AGENT, "Accept": "text/markdown,text/plain,*/*"}
+        quote_url(url), headers={"User-Agent": USER_AGENT, "Accept": "text/markdown,text/plain,*/*"}
     )
     for attempt in range(retries):
         try:
@@ -91,7 +98,9 @@ def http_get(url, timeout=30, retries=MAX_RETRIES):
 # ---------------------------------------------------------------------------
 def normalize(url, base_url=INDEX_URL):
     """Absolute, fragment/query-free URL on the docs host, or None if off-site."""
-    url = urllib.parse.urljoin(base_url, url.strip())
+    # A few page slugs end in a literal "?" (e.g. ".../gif-display-fail-in-native-in-app?.md").
+    url = url.strip().replace("?.md", "%3F.md")
+    url = urllib.parse.urljoin(base_url, url)
     p = urllib.parse.urlsplit(url)
     host = p.netloc.lower()
     base_host = urllib.parse.urlsplit(BASE).netloc.lower()
@@ -131,6 +140,19 @@ def section_of(url):
     return parts[0] if parts else ""
 
 
+def index_locale(url):
+    """Locale of an llms index such as /docs/_llms/ja/api.md or /docs/_llms/en/api-guide.md."""
+    path = urllib.parse.urlsplit(url).path
+    if "/_llms/" not in path:
+        return "en"
+    seg = path.split("/_llms/", 1)[1].split("/")[0]
+    seg = seg[:-3] if seg.endswith(".md") else seg
+    return seg.lower() if seg.lower() in LOCALES else "en"
+
+
+SKIP_EXT = (".yaml", ".yml", ".json", ".xml", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".pdf", ".zip")
+
+
 def is_index_url(url):
     path = urllib.parse.urlsplit(url).path
     return "/_llms/" in path or path.endswith("llms.txt") or path.endswith("llms-full.txt")
@@ -154,6 +176,8 @@ def parse_index(text, source_url, items, seen_pages, seen_indexes, depth, all_la
             if is_index_url(url):
                 if url.endswith("llms-full.txt") or url in seen_indexes or depth >= MAX_INDEX_DEPTH:
                     continue
+                if not all_languages and index_locale(url) != "en":
+                    continue
                 seen_indexes.add(url)
                 try:
                     sub = http_get(url)
@@ -162,6 +186,8 @@ def parse_index(text, source_url, items, seen_pages, seen_indexes, depth, all_la
                     continue
                 parse_index(sub, url, items, seen_pages, seen_indexes, depth + 1, all_languages)
                 continue
+            if url.lower().endswith(SKIP_EXT):
+                continue  # OpenAPI specs, images etc. are not doc pages
             purl = page_url(url)
             if purl in seen_pages:
                 continue

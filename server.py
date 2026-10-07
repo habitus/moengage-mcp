@@ -52,8 +52,17 @@ def log(*a):
 WORD_RE = re.compile(r"[a-z0-9]+")
 
 
+def _stem(t):
+    # light plural folding so "template" matches "templates", "campaigns" matches "campaign"
+    if len(t) > 3 and t.endswith("ies"):
+        return t[:-3] + "y"
+    if len(t) > 3 and t.endswith("s") and not t.endswith(("ss", "us", "is")):
+        return t[:-1]
+    return t
+
+
 def _tokens(s):
-    return WORD_RE.findall(s.lower())
+    return [_stem(t) for t in WORD_RE.findall(s.lower())]
 
 
 # ---------------------------------------------------------------------------
@@ -77,8 +86,8 @@ def get_store():
                 rec = json.loads(line)
                 text = rec.get("text") or rec.get("description", "")
                 ttoks = set(_tokens(rec.get("title", "")))
-                meta = " ".join(rec.get("tags", []) + [rec.get("group", ""), rec.get("description", "")])
-                metatoks = set(_tokens(meta))
+                desctoks = set(_tokens(rec.get("description", "")))
+                metatoks = set(_tokens(" ".join(rec.get("tags", []) + [rec.get("group", "")])))
                 pathtoks = set(_tokens(" ".join(bi.rel_parts(rec["url"]))))
                 counts = Counter(_tokens(text))
                 doc = {
@@ -87,7 +96,9 @@ def get_store():
                     "description": rec.get("description", ""),
                     "section": rec.get("section") or bi.section_of(rec["url"]),
                     "text": text,
+                    "low": " ".join(WORD_RE.findall(text.lower())),
                     "ttoks": ttoks,
+                    "desctoks": desctoks,
                     "metatoks": metatoks,
                     "pathtoks": pathtoks,
                     "counts": counts,
@@ -95,7 +106,7 @@ def get_store():
                 }
                 docs.append(doc)
                 by_url[rec["url"]] = doc
-                for tok in set(counts) | ttoks | metatoks | pathtoks:
+                for tok in set(counts) | ttoks | desctoks | metatoks | pathtoks:
                     df[tok] += 1
     except Exception as e:
         log("store load failed:", e)
@@ -128,6 +139,8 @@ def _search_fulltext(store, query, limit, section):
     if not q:
         return []
     ql = query.lower().strip()
+    raw = WORD_RE.findall(ql)
+    phrases = [" ".join(raw[i:i + 2]) for i in range(len(raw) - 1)]  # adjacent word pairs
     idf = {t: math.log(1 + (N - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5)) for t in q}
     k1, b = 1.2, 0.75
     scored = []
@@ -145,6 +158,9 @@ def _search_fulltext(store, query, limit, section):
             if t in d["ttoks"]:
                 score += 3.0 * w
                 hit = True
+            if t in d["desctoks"]:
+                score += 1.5 * w
+                hit = True
             if t in d["metatoks"] or t in d["pathtoks"]:
                 score += 1.0 * w
                 hit = True
@@ -152,6 +168,10 @@ def _search_fulltext(store, query, limit, section):
         if not score:
             continue
         score *= 0.5 + 0.5 * matched / len(q)  # favour pages matching every term
+        for ph in phrases:  # reward query words appearing together, e.g. "exit criteria"
+            n = d["low"].count(ph)
+            if n:
+                score += 2.0 * math.log1p(min(n, 10))
         tl = d["title"].lower()
         if ql == tl:
             score += 15
